@@ -10,13 +10,17 @@ import ai.koog.prompt.executor.clients.LLMClientException
 import ai.koog.prompt.llm.LLMCapability
 import ai.koog.prompt.llm.LLMProvider
 import ai.koog.prompt.llm.LLModel
+import ai.koog.prompt.streaming.StreamFrame
 import aws.sdk.kotlin.runtime.auth.credentials.StaticCredentialsProvider
 import aws.sdk.kotlin.services.bedrockruntime.BedrockRuntimeClient
 import aws.sdk.kotlin.services.bedrockruntime.model.ApplyGuardrailRequest
 import aws.sdk.kotlin.services.bedrockruntime.model.ApplyGuardrailResponse
+import aws.sdk.kotlin.services.bedrockruntime.model.ContentBlockDelta
+import aws.sdk.kotlin.services.bedrockruntime.model.ContentBlockDeltaEvent
 import aws.sdk.kotlin.services.bedrockruntime.model.ConverseRequest
 import aws.sdk.kotlin.services.bedrockruntime.model.ConverseResponse
 import aws.sdk.kotlin.services.bedrockruntime.model.ConverseStreamRequest
+import aws.sdk.kotlin.services.bedrockruntime.model.ConverseStreamOutput
 import aws.sdk.kotlin.services.bedrockruntime.model.ConverseStreamResponse
 import aws.sdk.kotlin.services.bedrockruntime.model.CountTokensRequest
 import aws.sdk.kotlin.services.bedrockruntime.model.CountTokensResponse
@@ -37,10 +41,14 @@ import aws.sdk.kotlin.services.bedrockruntime.model.InvokeModelWithResponseStrea
 import aws.sdk.kotlin.services.bedrockruntime.model.InvokeModelWithResponseStreamResponse
 import aws.sdk.kotlin.services.bedrockruntime.model.ListAsyncInvokesRequest
 import aws.sdk.kotlin.services.bedrockruntime.model.ListAsyncInvokesResponse
+import aws.sdk.kotlin.services.bedrockruntime.model.MessageStopEvent
+import aws.sdk.kotlin.services.bedrockruntime.model.ReasoningContentBlockDelta
 import aws.sdk.kotlin.services.bedrockruntime.model.StartAsyncInvokeRequest
 import aws.sdk.kotlin.services.bedrockruntime.model.StartAsyncInvokeResponse
+import aws.sdk.kotlin.services.bedrockruntime.model.StopReason
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.parallel.Execution
@@ -639,6 +647,93 @@ class BedrockLLMClientTest {
         val cohereModel = BedrockModels.Embeddings.CohereEmbedEnglishV3
         assertFailsWith<IllegalArgumentException> {
             client.executeStreaming(prompt, cohereModel, emptyList()).toList()
+        }
+    }
+
+    @Test
+    fun `converseStream API emits reasoning content deltas`() = runTest {
+        val reasoningText = "I need to inspect the market context first."
+        val mockClient = object : BedrockRuntimeClient {
+            override suspend fun applyGuardrail(input: ApplyGuardrailRequest): ApplyGuardrailResponse =
+                throw UnsupportedOperationException("applyGuardrail not implemented in mock client")
+
+            override val config: BedrockRuntimeClient.Config
+                get() = throw UnsupportedOperationException("config not implemented in mock client")
+
+            override suspend fun converse(input: ConverseRequest): ConverseResponse =
+                throw UnsupportedOperationException("converse not implemented in mock client")
+
+            override suspend fun <T> converseStream(
+                input: ConverseStreamRequest,
+                block: suspend (ConverseStreamResponse) -> T
+            ): T = block(
+                ConverseStreamResponse {
+                    stream = flow {
+                        emit(
+                            ConverseStreamOutput.ContentBlockDelta(
+                                ContentBlockDeltaEvent {
+                                    delta = ContentBlockDelta.ReasoningContent(
+                                        ReasoningContentBlockDelta.Text(reasoningText)
+                                    )
+                                    contentBlockIndex = 0
+                                }
+                            )
+                        )
+                        emit(
+                            ConverseStreamOutput.MessageStop(
+                                MessageStopEvent { stopReason = StopReason.EndTurn }
+                            )
+                        )
+                    }
+                }
+            )
+
+            override suspend fun countTokens(input: CountTokensRequest): CountTokensResponse =
+                throw UnsupportedOperationException("countTokens not implemented in mock client")
+
+            override suspend fun getAsyncInvoke(input: GetAsyncInvokeRequest): GetAsyncInvokeResponse =
+                throw UnsupportedOperationException("getAsyncInvoke not implemented in mock client")
+
+            override suspend fun invokeModel(input: InvokeModelRequest): InvokeModelResponse =
+                throw UnsupportedOperationException("invokeModel not implemented in mock client")
+
+            override suspend fun <T> invokeModelWithBidirectionalStream(
+                input: InvokeModelWithBidirectionalStreamRequest,
+                block: suspend (InvokeModelWithBidirectionalStreamResponse) -> T
+            ): T =
+                throw UnsupportedOperationException("invokeModelWithBidirectionalStream not implemented in mock client")
+
+            override suspend fun <T> invokeModelWithResponseStream(
+                input: InvokeModelWithResponseStreamRequest,
+                block: suspend (InvokeModelWithResponseStreamResponse) -> T
+            ): T =
+                throw UnsupportedOperationException("invokeModelWithResponseStream not implemented in mock client")
+
+            override suspend fun listAsyncInvokes(input: ListAsyncInvokesRequest): ListAsyncInvokesResponse =
+                throw UnsupportedOperationException("listAsyncInvokes not implemented in mock client")
+
+            override suspend fun startAsyncInvoke(input: StartAsyncInvokeRequest): StartAsyncInvokeResponse =
+                throw UnsupportedOperationException("startAsyncInvoke not implemented in mock client")
+
+            override fun close() = Unit
+        }
+        val client = BedrockLLMClient(
+            mockClient,
+            apiMethod = BedrockAPIMethod.Converse,
+        )
+
+        try {
+            val frames = client.executeStreaming(
+                Prompt.build("test") { user("Hello") },
+                BedrockModels.AnthropicClaude4Sonnet,
+                emptyList()
+            ).toList()
+
+            val reasoningFrame = frames.filterIsInstance<StreamFrame.ReasoningDelta>().single()
+            reasoningFrame.text shouldBe reasoningText
+            reasoningFrame.index shouldBe 0
+        } finally {
+            client.close()
         }
     }
 
